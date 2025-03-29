@@ -3,7 +3,6 @@ from nonebot.adapters import Bot
 
 from .config import __KERNEL_VERSION__, config_manager
 
-
 driver = get_driver()
 
 

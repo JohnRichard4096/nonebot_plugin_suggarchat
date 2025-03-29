@@ -1,13 +1,12 @@
-from collections.abc import Awaitable, Callable
 import inspect
 import sys
+from collections.abc import Awaitable, Callable
 
 from nonebot import logger
 from nonebot.exception import FinishedException, ProcessException, StopPropagation
 
 from .event import SuggarEvent
 from .exception import BlockException, CancelException, PassException
-
 
 """
 suggar matcher
@@ -38,7 +37,7 @@ class SuggarMatcher:
           - priority_value: 事件优先级，默认为10
           - block: 是否阻塞事件，默认为False
         """
-        if not priority_value > 0:
+        if priority_value <= 0:
             raise ValueError("事件优先级不能为0或负！")
         if event_type is None and self.event_type != "":
             event_type = self.event_type
@@ -139,7 +138,7 @@ class SuggarMatcher:
                         # 创建一个新的参数列表
                         new_args = []
                         used_indices = set()
-                        for param_name, param_type in filtered_param_types.items():
+                        for param_type in filtered_param_types.values():
                             for i, arg in enumerate(args):
                                 if i in used_indices:
                                     continue
@@ -151,11 +150,11 @@ class SuggarMatcher:
 
                         # 获取关键词参数类型注解
                         params = sig.parameters
-                        # 构建传递给处理程序的参数字典
-                        f_kwargs = {}
-                        for param_name, param in params.items():
-                            if param.annotation in kwargs:
-                                f_kwargs[param_name] = kwargs[param.annotation]
+                        f_kwargs = {
+                            param_name: kwargs[param.annotation]
+                            for param_name, param in params.items()
+                            if param.annotation in kwargs
+                        }
                         # 调用处理程序
                         try:
                             logger.info(
@@ -186,9 +185,7 @@ class SuggarMatcher:
                             logger.error(f"Exception message: {exc_value!s}")
                             import traceback
 
-                            back = ""
-                            for i in traceback.format_tb(exc_traceback):
-                                back += i
+                            back = "".join(traceback.format_tb(exc_traceback))
                             logger.error(back)
                             continue
                         finally:

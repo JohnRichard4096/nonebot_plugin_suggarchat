@@ -1,13 +1,14 @@
 import asyncio
-from collections.abc import Callable
-from datetime import datetime
 import random
 import sys
 import time
+from collections.abc import Callable, Coroutine
+from datetime import datetime
 from typing import Any
 
-from nonebot import logger, on_command, on_message, on_notice
 import nonebot.adapters
+import openai
+from nonebot import logger, on_command, on_message, on_notice
 from nonebot.adapters import Bot, Message
 from nonebot.adapters.onebot.v11 import (
     GroupIncreaseNoticeEvent,
@@ -22,7 +23,6 @@ from nonebot.exception import NoneBotException
 from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 from nonebot.rule import to_me
-import openai
 from openai.types.chat.chat_completion import ChatCompletion
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 
@@ -39,7 +39,6 @@ from .resources import (
     synthesize_message,
     write_memory_data,
 )
-
 
 debug = False
 
@@ -60,8 +59,8 @@ async def openai_get_chat(
     logger.debug(f"Key：{key[:7]}...")
     logger.debug(f"API base_url：{base_url}")
     if (
-        str(config.open_ai_base_url).strip() == ""
-        or str(config.open_ai_api_key).strip() == ""
+        not str(config.open_ai_base_url).strip()
+        or not str(config.open_ai_api_key).strip()
     ):
         raise RuntimeError("错误！OpenAI Url或Key为空！")
     client = openai.AsyncOpenAI(
@@ -103,10 +102,8 @@ async def openai_get_chat(
             response = completion.choices[0].message.content
         else:
             raise RuntimeError("Unexpected completion type received.")
-    return response if response else ""
+    return response or ""
 
-
-from collections.abc import Coroutine
 
 
 protocols_adapters: dict[
@@ -184,9 +181,7 @@ async def rule(event: MessageEvent, bot: Bot) -> bool:
         return True
 
     # 如果没有开启随机回复功能，则不回复
-    if not config_manager.config.fake_people:
-        return False
-    else:
+    if config_manager.config.fake_people:
         # 私聊消息不进行随机回复
         if event.is_tome() and isinstance(event, PrivateMessageEvent):
             """私聊过滤"""
@@ -239,8 +234,7 @@ async def rule(event: MessageEvent, bot: Bot) -> bool:
         # 更新记忆数据
         write_memory_data(event, memory_data)
 
-        # 不回复
-        return False
+    return False
 
 
 async def is_member(event: GroupMessageEvent, bot: Bot) -> bool:
@@ -263,9 +257,7 @@ async def is_member(event: GroupMessageEvent, bot: Bot) -> bool:
     # 提取成员在群组中的角色
     user_role = user_role.get("role")
     # 判断成员角色是否为"member"（普通成员）
-    if user_role == "member":
-        return True
-    return False
+    return user_role == "member"
 
 
 async def get_chat(messages: list, bot: Bot | None = None) -> str:
@@ -306,7 +298,7 @@ async def get_chat(messages: list, bot: Bot | None = None) -> str:
             logger.error(
                 f"预设 {config_manager.config.preset} 未找到，已重置为主配置文件"
             )
-            logger.info("找到：模型：" + config_manager.config.model)
+            logger.info(f"找到：模型：{config_manager.config.model}")
             config_manager.config.preset = "__main__"
             key = config_manager.config.open_ai_api_key
             model = config_manager.config.model
@@ -321,7 +313,7 @@ async def get_chat(messages: list, bot: Bot | None = None) -> str:
             messages,
             max_tokens,
             config_manager.config,
-            bot if bot else nonebot.get_bot(),
+            bot or nonebot.get_bot(),
         )
     elif config_manager.config.protocol not in protocols_adapters:
         raise Exception(f"协议 {config_manager.config.protocol} 的适配器未找到!")
@@ -333,7 +325,7 @@ async def get_chat(messages: list, bot: Bot | None = None) -> str:
             messages,
             max_tokens,
             config_manager.config,
-            bot if bot else nonebot.get_bot(),
+            bot or nonebot.get_bot(),
         )
 
 
@@ -385,18 +377,12 @@ async def sessions_handle(bot: Bot, event: MessageEvent, args: Message = Command
     data = get_memory_data(event)
 
     # 权限验证流程（仅群组消息需要验证）
-    if isinstance(event, GroupMessageEvent):
-        # 检查用户是否为普通成员且不在管理员列表
-        if (
-            await bot.get_group_member_info(
-                group_id=event.group_id, user_id=event.user_id
-            )
-        )["role"] == "member" and event.user_id not in config_manager.config.admins:
-            await sessions.finish("你没有操作历史会话的权限")
-        id = event.group_id  # 群组场景使用群号作为标识
-    else:
-        id = event.user_id  # 私聊场景使用用户ID作为标识
-
+    if isinstance(event, GroupMessageEvent) and ((
+                await bot.get_group_member_info(
+                    group_id=event.group_id, user_id=event.user_id
+                )
+            )["role"] == "member" and event.user_id not in config_manager.config.admins):
+        await sessions.finish("你没有操作历史会话的权限")
     # 解析输入参数
     arg_list = args.extract_plain_text().strip().split()
 
@@ -495,7 +481,7 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
     arg = args.extract_plain_text().strip()
 
     # 如果参数不为空
-    if not arg == "":
+    if arg != "":
         # 遍历模型列表
         for i in config_manager.models:
             # 如果模型名称与参数匹配
@@ -514,9 +500,7 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
         config_manager.config.preset = "__main__"
         config_manager.save_config()
         # 回复重置成功
-        await set_preset.finish(
-            "已重置预设为：主配置文件，模型：" + config_manager.config.model
-        )
+        await set_preset.finish(f"已重置预设为：主配置文件，模型：{config_manager.config.model}")
 
 
 @presets.handle()
@@ -686,18 +670,18 @@ async def _(bot: Bot, event: GroupRecallNoticeEvent, matcher: Matcher):
     if not config_manager.config.enable:
         matcher.skip()
     # 通过随机数决定是否响应，增加趣味性和减少响应频率
-    if not random.randint(1, 3) == 2:
+    if random.randint(1, 3) != 2:
         return
     # 检查配置中是否允许在删除自己的消息后发言，不允许则直接返回
     if not config_manager.config.say_after_self_msg_be_deleted:
         return
-    # 从配置中获取删除消息后可能的回复内容
-    recallmsg = config_manager.config.after_deleted_say_what
     # 判断事件是否为机器人自己删除了自己的消息
     if event.user_id == event.self_id:
         # 如果是机器人自己删除了自己的消息，并且操作者也是机器人自己，则不进行回复
         if event.operator_id == event.self_id:
             return
+        # 从配置中获取删除消息后可能的回复内容
+        recallmsg = config_manager.config.after_deleted_say_what
         # 从预设的回复内容中随机选择一条发送
         await recall.send(random.choice(recallmsg))
         return
@@ -817,8 +801,7 @@ async def _(event: PokeNotifyEvent, bot: Bot, matcher: Matcher):
                 if not config_manager.config.nature_chat_style:
                     await poke.send(message)
                 else:
-                    response_list = split_message_into_chats(response)
-                    if response_list:  # 确保消息列表非空
+                    if response_list := split_message_into_chats(response):
                         # 将@用户添加到第一条消息
                         first_message = (
                             MessageSegment.at(event.user_id)
@@ -832,7 +815,7 @@ async def _(event: PokeNotifyEvent, bot: Bot, matcher: Matcher):
                             await poke.send(message)
                             await asyncio.sleep(
                                 random.randint(1, 3)
-                                + int(len(message) / random.randint(80, 100))
+                                + len(message) // random.randint(80, 100)
                             )
 
         else:
@@ -877,8 +860,8 @@ async def _(event: PokeNotifyEvent, bot: Bot, matcher: Matcher):
                 for message in response_list:
                     await poke.send(message)
                     await asyncio.sleep(
-                        random.randint(1, 3)
-                        + int(len(message) / random.randint(80, 100))
+                            random.randint(1, 3)
+                            + len(message) // random.randint(80, 100)
                     )
 
     except Exception:
@@ -981,12 +964,10 @@ async def _(bot: Bot, event: GroupMessageEvent, matcher: Matcher):
     # 检查记忆数据是否与当前群组相关
     if data["id"] == event.group_id:
         # 如果聊天功能已启用，则发送提示信息
-        if data["enable"]:
-            await enable.send("聊天启用")
-        else:
+        if not data["enable"]:
             # 如果聊天功能未启用，则启用并发送提示信息
             data["enable"] = True
-            await enable.send("聊天启用")
+        await enable.send("聊天启用")
     # 更新记忆数据
     write_memory_data(event, data)
 
@@ -1133,23 +1114,22 @@ async def _(event: MessageEvent, matcher: Matcher, bot: Bot):
                             )
                             return
                         elif event.reply:
-                            if session["id"] == event.group_id:
-                                if "继续" in event.reply.message.extract_plain_text():
-                                    try:
-                                        if time.time() - session["timestamp"] < 100:
-                                            await bot.delete_msg(
-                                                message_id=session["message_id"]
-                                            )
-                                    except Exception:
-                                        pass
-                                    session_clear_group.remove(session)
-                                    data["memory"]["messages"] = data["sessions"][
-                                        len(data["sessions"]) - 1
-                                    ]
-                                    data["sessions"].remove(
-                                        data["sessions"][len(data["sessions"]) - 1]
-                                    )
-                                    await chat.send("让我们继续聊天吧～")
+                            if session["id"] == event.group_id and "继续" in event.reply.message.extract_plain_text():
+                                try:
+                                    if time.time() - session["timestamp"] < 100:
+                                        await bot.delete_msg(
+                                            message_id=session["message_id"]
+                                        )
+                                except Exception:
+                                    pass
+                                session_clear_group.remove(session)
+                                data["memory"]["messages"] = data["sessions"][
+                                    len(data["sessions"]) - 1
+                                ]
+                                data["sessions"].remove(
+                                    data["sessions"][len(data["sessions"]) - 1]
+                                )
+                                await chat.send("让我们继续聊天吧～")
 
                     group_id = event.group_id
                     user_id = event.user_id
@@ -1385,23 +1365,22 @@ async def _(event: MessageEvent, matcher: Matcher, bot: Bot):
                         )
                         return
                     elif event.reply:
-                        if session["id"] == event.user_id:
-                            if "继续" in event.reply.message.extract_plain_text():
-                                try:
-                                    if time.time() - session["timestamp"] < 100:
-                                        await bot.delete_msg(
-                                            message_id=session["message_id"]
-                                        )
-                                except Exception:
-                                    pass
-                                session_clear_user.remove(session)
-                                data["memory"]["messages"] = data["sessions"][
-                                    len(data["sessions"]) - 1
-                                ]
-                                data["sessions"].remove(
-                                    data["sessions"][len(data["sessions"]) - 1]
-                                )
-                                await chat.send("让我们继续聊天吧～")
+                        if session["id"] == event.user_id and "继续" in event.reply.message.extract_plain_text():
+                            try:
+                                if time.time() - session["timestamp"] < 100:
+                                    await bot.delete_msg(
+                                        message_id=session["message_id"]
+                                    )
+                            except Exception:
+                                pass
+                            session_clear_user.remove(session)
+                            data["memory"]["messages"] = data["sessions"][
+                                len(data["sessions"]) - 1
+                            ]
+                            data["sessions"].remove(
+                                data["sessions"][len(data["sessions"]) - 1]
+                            )
+                            await chat.send("让我们继续聊天吧～")
                 if data["id"] == event.user_id:
                     content = ""
                     rl = ""

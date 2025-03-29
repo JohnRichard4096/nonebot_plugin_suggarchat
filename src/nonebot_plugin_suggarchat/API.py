@@ -116,9 +116,7 @@ class Admin:
         - Admin: 返回Admin实例，支持链式调用。
         """
         self.config.admins.append(user_id)
-        self.config.save_to_toml(config_manager.toml_config)
-        self.config = config_manager.config
-        return self
+        return self._save_config_to_toml()
 
     def set_admin_group(self, group_id: int):
         """
@@ -131,6 +129,9 @@ class Admin:
         - Admin: 返回Admin实例，支持链式调用。
         """
         self.config.admin_group = group_id
+        return self._save_config_to_toml()
+
+    def _save_config_to_toml(self):
         self.config.save_to_toml(config_manager.toml_config)
         self.config = config_manager.config
         return self

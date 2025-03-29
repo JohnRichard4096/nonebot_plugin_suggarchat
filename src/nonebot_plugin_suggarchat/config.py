@@ -1,24 +1,18 @@
-from dataclasses import dataclass, field
 import json
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from pydantic import BaseModel
+import nonebot_plugin_localstore as store
 import tomli
 import tomli_w
-
+from pydantic import BaseModel
 
 __KERNEL_VERSION__: str = "V2.0.0-Public"
-# 获取当前工作目录
-CURRENT_DIR: Path = Path(os.getcwd())
 
 # 配置目录
-CONFIG_DIR: Path = CURRENT_DIR / "config" / "nonebot_plugin_suggarchat"
-DATA_DIR: Path = CURRENT_DIR / "data" / "nonebot_plugin_suggarchat"
-
-# 记忆存储路径
-GROUP_MEMORY_DIR: Path = DATA_DIR / "group"
-PRIVATE_MEMORY_DIR: Path = DATA_DIR / "private"
+CONFIG_DIR: Path = store.get_plugin_config_dir()
+DATA_DIR: Path = store.get_plugin_data_dir()
 
 
 class ModelPreset(BaseModel):
@@ -117,9 +111,8 @@ class Config(BaseModel):
 
 @dataclass
 class ConfigManager:
-    current_directory: str = os.getcwd()
-    config_dir: Path = Path(current_directory) / "config" / "nonebot_plugin_suggarchat"
-    data_dir: Path = Path(current_directory) / "data" / "nonebot_plugin_suggarchat"
+    config_dir: Path = CONFIG_DIR
+    data_dir: Path = DATA_DIR
     group_memory: Path = data_dir / "group"
     private_memory: Path = data_dir / "private"
     json_config: Path = config_dir / "config.json"
@@ -240,11 +233,7 @@ class ConfigManager:
 
         :raises KeyError: 如果配置项已存在，则抛出异常
         """
-        if not hasattr(self.config, key):
-            setattr(self.config, key, None)
-            self.save_config()
-        else:
-            raise KeyError(f"配置项 {key} 已存在")
+        self._register_config_key(key, "配置项 ")
 
     def reg_model_config(self, key: str):
         """
@@ -254,11 +243,13 @@ class ConfigManager:
 
         :raises KeyError: 如果配置项已存在，则抛出异常
         """
-        if not hasattr(self.config, key):
-            setattr(self.config, key, None)
-            self.save_config()
-        else:
-            raise KeyError(f"模型配置项 {key} 已存在")
+        self._register_config_key(key, "模型配置项 ")
+
+    def _register_config_key(self, key, arg1):
+        if hasattr(self.config, key):
+            raise KeyError(f"{arg1}{key} 已存在")
+        setattr(self.config, key, None)
+        self.save_config()
 
 
 config_manager = ConfigManager()

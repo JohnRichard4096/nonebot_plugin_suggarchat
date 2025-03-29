@@ -1,11 +1,12 @@
-from datetime import datetime
 import json
-from pathlib import Path
 import re
+from datetime import datetime
+from pathlib import Path
 
 import chardet
 import jieba
 import nonebot
+import pytz
 from nonebot.adapters import Bot
 from nonebot.adapters.onebot.v11 import (
     Event,
@@ -15,7 +16,6 @@ from nonebot.adapters.onebot.v11 import (
     PrivateMessageEvent,
 )
 from nonebot.log import logger
-import pytz
 
 from .config import config_manager
 
@@ -28,10 +28,7 @@ def format_datetime_timestamp(time: int) -> str:
     formatted_weekday = now.strftime("%A")
     formatted_time = now.strftime("%I:%M:%S %p")
 
-    # 组合格式化的字符串
-    formatted_datetime = f"[{formatted_date} {formatted_weekday} {formatted_time}]"
-
-    return formatted_datetime
+    return f"[{formatted_date} {formatted_weekday} {formatted_time}]"
 
 
 def hybrid_token_count(text: str, mode: str = "word") -> int:
@@ -79,14 +76,12 @@ def split_message_into_chats(text):
     start = 0
     for match in sentence_delimiters.finditer(text):
         end = match.end()
-        sentence = text[start:end].strip()
-        if sentence:
+        if sentence := text[start:end].strip():
             sentences.append(sentence)
         start = end
 
     if start < len(text):
-        remaining = text[start:].strip()
-        if remaining:
+        if remaining := text[start:].strip():
             sentences.append(remaining)
 
     return sentences
@@ -161,29 +156,16 @@ def get_memory_data(event: Event) -> dict:
         Path.mkdir(group_memory)
 
     # 根据事件类型判断是私聊还是群聊
-    if isinstance(event, PrivateMessageEvent):
-        # 处理私聊事件
-        user_id = event.user_id
-        conf_path = Path(private_memory / f"{user_id}.json")
-        # 如果私聊记忆数据不存在，则创建初始数据结构
-        if not conf_path.exists():
-            with open(str(conf_path), "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "id": user_id,
-                        "enable": True,
-                        "memory": {"messages": []},
-                        "full": False,
-                    },
-                    f,
-                    ensure_ascii=True,
-                    indent=0,
-                )
-    elif isinstance(event, GroupMessageEvent):
-        # 处理群聊事件
+    if (
+        (not isinstance(event, PrivateMessageEvent)
+        and not isinstance(event, GroupMessageEvent)
+        and isinstance(event, PokeNotifyEvent)
+        and event.group_id)
+        or (not isinstance(event, PrivateMessageEvent)
+        and isinstance(event, GroupMessageEvent))
+    ):
         group_id = event.group_id
         conf_path = Path(group_memory / f"{group_id}.json")
-        # 如果群聊记忆数据不存在，则创建初始数据结构
         if not conf_path.exists():
             with open(str(conf_path), "w", encoding="utf-8") as f:
                 json.dump(
@@ -197,39 +179,26 @@ def get_memory_data(event: Event) -> dict:
                     ensure_ascii=True,
                     indent=0,
                 )
-    elif isinstance(event, PokeNotifyEvent):
-        if event.group_id:
-            group_id = event.group_id
-            conf_path = Path(group_memory / f"{group_id}.json")
-            if not conf_path.exists():
-                with open(str(conf_path), "w", encoding="utf-8") as f:
-                    json.dump(
-                        {
-                            "id": group_id,
-                            "enable": True,
-                            "memory": {"messages": []},
-                            "full": False,
-                        },
-                        f,
-                        ensure_ascii=True,
-                        indent=0,
-                    )
-        else:
-            user_id = event.user_id
-            conf_path = Path(private_memory / f"{user_id}.json")
-            if not conf_path.exists():
-                with open(str(conf_path), "w", encoding="utf-8") as f:
-                    json.dump(
-                        {
-                            "id": user_id,
-                            "enable": True,
-                            "memory": {"messages": []},
-                            "full": False,
-                        },
-                        f,
-                        ensure_ascii=True,
-                        indent=0,
-                    )
+    elif (
+        (not isinstance(event, PrivateMessageEvent)
+        and isinstance(event, PokeNotifyEvent))
+        or isinstance(event, PrivateMessageEvent)
+    ):
+        user_id = event.user_id
+        conf_path = Path(private_memory / f"{user_id}.json")
+        if not conf_path.exists():
+            with open(str(conf_path), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "id": user_id,
+                        "enable": True,
+                        "memory": {"messages": []},
+                        "full": False,
+                    },
+                    f,
+                    ensure_ascii=True,
+                    indent=0,
+                )
     convert_to_utf8(conf_path)
     # 读取并返回记忆数据
     with open(str(conf_path), encoding="utf-8") as f:
@@ -309,18 +278,20 @@ async def get_friend_info(qq_number: int) -> str:
     bot = nonebot.get_bot()  # 假设只有一个Bot实例运行
     friend_list = await bot.get_friend_list()
 
-    for friend in friend_list:
-        if friend["user_id"] == qq_number:
-            return friend["nickname"]  # 返回找到的好友的昵称
-
-    return ""
+    return next(
+        (
+            friend["nickname"]
+            for friend in friend_list
+            if friend["user_id"] == qq_number
+        ),
+        "",
+    )
 
 
 async def get_friend_qq_list():
     bot = nonebot.get_bot()
     friend_list = await bot.get_friend_list()
-    friend_qq_list = [friend["user_id"] for friend in friend_list]
-    return friend_qq_list
+    return [friend["user_id"] for friend in friend_list]
 
 
 def split_list(lst: list, threshold: int) -> list:
@@ -334,12 +305,7 @@ def split_list(lst: list, threshold: int) -> list:
     if len(lst) <= threshold:
         return [lst]
 
-    result = []
-    for i in range(0, len(lst), threshold):
-        chunk = lst[i : i + threshold]
-        result.append(chunk)
-
-    return result
+    return [lst[i : i + threshold] for i in range(0, len(lst), threshold)]
 
 
 async def get_group_member_qq_numbers(group_id: int) -> list[int]:
@@ -352,10 +318,7 @@ async def get_group_member_qq_numbers(group_id: int) -> list[int]:
     bot = nonebot.get_bot()  # 获取当前机器人实例
     member_list = await bot.get_group_member_list(group_id=group_id)
 
-    # 提取每个成员的QQ号
-    qq_numbers = [member["user_id"] for member in member_list]
-
-    return qq_numbers
+    return [member["user_id"] for member in member_list]
 
 
 async def is_same_day(timestamp1: int, timestamp2: int) -> bool:
@@ -404,7 +367,4 @@ def get_current_datetime_timestamp():
     formatted_weekday = now.strftime("%A")  # 星期保持完整名称[9](@ref)
     formatted_time = now.strftime("%H:%M:%S")  # 关键修改点：%H 表示24小时制[2,8](@ref)
 
-    # 组合格式化的字符串（移除AM/PM）
-    formatted_datetime = f"[{formatted_date} {formatted_weekday} {formatted_time}]"
-
-    return formatted_datetime
+    return f"[{formatted_date} {formatted_weekday} {formatted_time}]"
