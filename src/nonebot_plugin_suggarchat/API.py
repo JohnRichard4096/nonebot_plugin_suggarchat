@@ -2,10 +2,9 @@ from collections.abc import Callable
 
 from nonebot import logger
 
-from . import suggar
 from .config import Config as Conf
 from .config import ConfigManager, config_manager
-from .suggar import get_chat, send_to_admin
+from .suggar import chat_manager, get_chat, protocols_adapters, send_to_admin
 
 Config: ConfigManager = config_manager
 
@@ -23,30 +22,30 @@ class Adapter:
         """
         注册一个适配器。
         """
-        if protocol in suggar.protocols_adapters:
+        if protocol in protocols_adapters:
             raise ValueError("协议适配器已存在")
-        suggar.protocols_adapters[protocol] = func
+        protocols_adapters[protocol] = func
 
     def get_adapter(self, protocol: str) -> Callable:
         """
         获取适配器方法。
         """
-        if protocol not in suggar.protocols_adapters:
+        if protocol not in protocols_adapters:
             raise ValueError("协议适配器不存在")
-        return suggar.protocols_adapters[protocol]
+        return protocols_adapters[protocol]
 
     def get_adapters(self) -> dict:
         """
         获取适配器方法。
         """
-        return suggar.protocols_adapters
+        return protocols_adapters
 
     @property
     def adapters(self) -> dict:
         """
         获取适配器方法。
         """
-        return suggar.protocols_adapters
+        return protocols_adapters
 
 
 class Menu:
@@ -71,7 +70,7 @@ class Menu:
         返回:
         - Menu: 返回 Menu 类的实例，支持方法链式调用。
         """
-        suggar.menu_msg += f"/{cmd_name} {args} 说明：{describe} \n"
+        chat_manager.menu_msg += f"/{cmd_name} {args} 说明：{describe} \n"
         return self
 
     @property
@@ -79,7 +78,7 @@ class Menu:
         """
         获取菜单项。
         """
-        return suggar.menu_msg
+        return chat_manager.menu_msg
 
 
 class Admin:

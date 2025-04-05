@@ -4,6 +4,7 @@ import random
 import sys
 import time
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -12,13 +13,16 @@ import openai
 from nonebot import logger, on_command, on_message, on_notice
 from nonebot.adapters import Bot, Message
 from nonebot.adapters.onebot.v11 import (
+    MessageSegment,
+)
+from nonebot.adapters.onebot.v11.event import (
     GroupIncreaseNoticeEvent,
     GroupMessageEvent,
     GroupRecallNoticeEvent,
     MessageEvent,
-    MessageSegment,
     PokeNotifyEvent,
     PrivateMessageEvent,
+    Reply,
 )
 from nonebot.exception import NoneBotException
 from nonebot.matcher import Matcher
@@ -40,18 +44,28 @@ from .resources import (
     write_memory_data,
 )
 
-debug = False
 
-session_clear_group = []
-session_clear_user = []
-custom_menu = []
+@dataclass
+class ChatManager:
+    debug: bool = False
+    session_clear_group: list[dict[str, Any]] = field(default_factory=list)
+    session_clear_user: list[dict[str, Any]] = field(default_factory=list)
+    custom_menu: list[dict[str, str]] = field(default_factory=list)
+    running_messages_poke: dict[str, Any] = field(default_factory=dict)
+    menu_msg: str = "聊天功能菜单:\n/聊天菜单 唤出菜单 \n/del_memory 丢失这个群/聊天的记忆 \n/enable 在群聊启用聊天 \n/disable 在群聊里关闭聊天\n/prompt <arg> [text] 设置聊群自定义补充prompt（--(show) 展示当前提示词，--(clear) 清空当前prompt，--(set) [文字]则设置提示词，e.g.:/prompt --(show)）,/prompt --(set) [text]。）\n/sessions指令帮助：\nset：覆盖当前会话为指定编号的会话\ndel：删除指定编号的会话\narchive：归档当前会话\nclear：清空所有会话\nPreset帮助：\n/presets 列出所有读取到的模型预设\n/set_preset 或 /设置预设 或 /设置模型预设  <预设名> 设置当前使用的预设"
 
-running_messages = {}
-running_messages_poke = {}
+
+chat_manager = ChatManager()
 
 
 async def openai_get_chat(
-    base_url, model, key, messages, max_tokens, config: Config, bot: Bot
+    base_url: str,
+    model: str,
+    key: str,
+    messages: list,
+    max_tokens: int,
+    config: Config,
+    bot: Bot,
 ) -> str:
     if (
         not str(config.open_ai_base_url).strip()
@@ -89,13 +103,13 @@ async def openai_get_chat(
             try:
                 if chunk.choices[0].delta.content is not None:
                     response += chunk.choices[0].delta.content
-                    if debug:
+                    if chat_manager.debug:
                         logger.debug(chunk.choices[0].delta.content)
             except IndexError:
                 break
         # 记录生成的响应日志
     else:
-        if debug:
+        if chat_manager.debug:
             logger.debug(response)
         if isinstance(completion, ChatCompletion):
             response = completion.choices[0].message.content
@@ -365,99 +379,156 @@ choose_prompt = on_command("choose_prompt", priority=10, block=True)
 @choose_prompt.handle()
 async def _(event: MessageEvent, args: Message = CommandArg()):
     """处理选择提示词的命令"""
-    # 检查是否启用功能，未启用则跳过处理
+
+    async def display_current_prompts() -> None:
+        """显示当前群组和私聊的提示词预设"""
+        msg = (
+            f"当前群组的提示词预设：{config_manager.config.group_prompt_character}\n"
+            f"当前私聊的提示词预设：{config_manager.config.private_prompt_character}"
+        )
+        await choose_prompt.finish(msg)
+
+    async def handle_group_prompt(arg_list: list[str]) -> None:
+        """处理群组提示词预设"""
+        if len(arg_list) >= 2:
+            for i in config_manager.get_prompts().group:
+                if i.name == arg_list[1]:
+                    config_manager.config.group_prompt_character = i.name
+                    config_manager.load_prompt()
+                    config_manager.save_config()
+                    await choose_prompt.finish(f"已设置群组的提示词预设为：{i.name}")
+            await choose_prompt.finish(
+                "未找到预设，请输入/choose_prompt group查看预设列表"
+            )
+        else:
+            await list_available_prompts(config_manager.get_prompts().group, "group")
+
+    async def handle_private_prompt(arg_list: list[str]) -> None:
+        """处理私聊提示词预设"""
+        if len(arg_list) >= 2:
+            for i in config_manager.get_prompts().private:
+                if i.name == arg_list[1]:
+                    config_manager.config.private_prompt_character = i.name
+                    config_manager.load_prompt()
+                    config_manager.save_config()
+                    await choose_prompt.finish(f"已设置私聊的提示词预设为：{i.name}")
+            await choose_prompt.finish(
+                "未找到预设，请输入/choose_prompt private查看预设列表"
+            )
+        else:
+            await list_available_prompts(
+                config_manager.get_prompts().private, "private"
+            )
+
+    async def list_available_prompts(prompts: list[Any], prompt_type: str) -> None:
+        """列出可用的提示词预设"""
+        msg = "可选的预设名称：\n"
+        for index, i in enumerate(prompts):
+            current_marker = (
+                " (当前)"
+                if (
+                    prompt_type == "group"
+                    and i.name == config_manager.config.group_prompt_character
+                )
+                or (
+                    prompt_type == "private"
+                    and i.name == config_manager.config.private_prompt_character
+                )
+                else ""
+            )
+            msg += f"{index + 1}). {i.name}{current_marker}\n"
+        await choose_prompt.finish(msg)
+
     if not config_manager.config.enable:
         choose_prompt.skip()
 
-    # 检查用户是否为管理员，非管理员则结束处理
     if event.user_id not in config_manager.config.admins:
         await choose_prompt.finish("只有管理员才能设置预设。")
 
-    # 提取命令参数
     arg_list = args.extract_plain_text().strip().split()
 
-    # 检查参数是否为空
-    if len(arg_list) >= 1:
-        # 如果参数为"group"，则设置群组的提示词预设
-        if arg_list[0] == "group":
-            if len(arg_list) >= 2:
-                # 遍历模型列表，查找匹配的预设名称
-                for i in config_manager.get_prompts().group:
-                    if i.name == arg_list[1]:
-                        # 设置群组的提示词预设
-                        config_manager.config.group_prompt_character = i.name
-                        config_manager.load_prompt()
-                        config_manager.save_config()
-                        await choose_prompt.finish(
-                            f"已设置群组的提示词预设为：{i.name}"
-                        )
-                await choose_prompt.finish(
-                    "未找到预设，请输入/choose_prompt group查看预设列表"
-                )
-            else:
-                # 输出可选的预设名称
-                msg = "可选的预设名称：\n"
-                for index, i in enumerate(config_manager.get_prompts().group):
-                    current_marker = (
-                        " (当前)"
-                        if i.name == config_manager.config.group_prompt_character
-                        else ""
-                    )
-                    msg += f"{index + 1}). {i.name}{current_marker}\n"
-                await choose_prompt.finish(msg)
-        elif arg_list[0] == "private":
-            if len(arg_list) >= 2:
-                # 遍历模型列表，查找匹配的预设名称
-                for i in config_manager.get_prompts().private:
-                    if i.name == arg_list[1]:
-                        # 设置私聊的提示词预设
-                        config_manager.config.private_prompt_character = i.name
-                        config_manager.load_prompt()
-                        config_manager.save_config()
-                        await choose_prompt.finish(
-                            f"已设置私聊的提示词预设为：{i.name}"
-                        )
-                await choose_prompt.finish(
-                    "未找到预设，请输入/choose_prompt private查看预设列表"
-                )
-            else:
-                # 输出可选的预设名称
-                msg = "可选的预设名称：\n"
-                for index, i in enumerate(config_manager.get_prompts().private):
-                    current_marker = (
-                        " (当前)"
-                        if i.name == config_manager.config.private_prompt_character
-                        else ""
-                    )
-                    msg += f"{index + 1}). {i.name}{current_marker}\n"
-                await choose_prompt.finish(msg)
-    else:
-        msg = f"当前群组的提示词预设：{config_manager.config.group_prompt_character}\n"
-        msg += f"当前私聊的提示词预设：{config_manager.config.private_prompt_character}"
-        await choose_prompt.finish(msg)
+    if not arg_list:
+        await display_current_prompts()
+        return
+
+    if arg_list[0] == "group":
+        await handle_group_prompt(arg_list)
+    elif arg_list[0] == "private":
+        await handle_private_prompt(arg_list)
 
 
 @sessions.handle()
 async def sessions_handle(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
-    """处理会话管理命令的入口函数
+    """处理会话管理命令的入口函数"""
 
-    Args:
-        bot: 机器人实例，用于执行API调用
-        event: 消息事件对象，包含事件上下文信息
-        args: 用户输入的命令参数，通过Message类型接收
+    async def display_sessions(data: dict) -> None:
+        """显示历史会话列表"""
+        if not data.get("sessions"):
+            await sessions.finish("没有历史会话")
+        message_content = "历史会话\n"
+        for index, msg in enumerate(data["sessions"]):
+            message_content += f"编号：{index}) ：{msg['messages'][0]['content'][9:]}... 时间：{datetime.fromtimestamp(msg['time']).strftime('%Y-%m-%d %I:%M:%S %p')}\n"
+        await sessions.finish(message_content)
 
-    功能说明：
-        实现历史会话的查看、覆盖、删除、归档等管理操作
-        支持群组管理员和配置中的管理员用户操作
-    """
-    # 检查全局会话控制开关
+    async def set_session(data: dict, arg_list: list[str], event: MessageEvent) -> None:
+        """覆盖当前会话为指定编号的会话"""
+        try:
+            if len(arg_list) >= 2:
+                data["memory"]["messages"] = data["sessions"][int(arg_list[1])][
+                    "messages"
+                ]
+                data["timestamp"] = time.time()
+                write_memory_data(event, data)
+                await sessions.send("完成记忆覆盖。")
+            else:
+                await sessions.finish("请输入正确编号")
+        except Exception:
+            await sessions.finish("覆盖记忆文件失败，这个对话可能损坏了。")
+
+    async def delete_session(
+        data: dict, arg_list: list[str], event: MessageEvent
+    ) -> None:
+        """删除指定编号的会话"""
+        try:
+            if len(arg_list) >= 2:
+                data["sessions"].remove(data["sessions"][int(arg_list[1])])
+                write_memory_data(event, data)
+            else:
+                await sessions.finish("请输入正确编号")
+        except Exception:
+            await sessions.finish("删除指定编号会话失败。")
+
+    async def archive_session(data: dict, event: MessageEvent) -> None:
+        """归档当前会话"""
+        try:
+            if data["memory"]["messages"]:
+                data["sessions"].append(
+                    {"messages": data["memory"]["messages"], "time": time.time()}
+                )
+                data["memory"]["messages"] = []
+                data["timestamp"] = time.time()
+                write_memory_data(event, data)
+                await sessions.finish("当前会话已归档。")
+            else:
+                await sessions.finish("当前对话为空！")
+        except Exception:
+            await sessions.finish("归档当前会话失败。")
+
+    async def clear_sessions(data: dict, event: MessageEvent) -> None:
+        """清空所有会话"""
+        try:
+            data["sessions"] = []
+            data["timestamp"] = time.time()
+            write_memory_data(event, data)
+            await sessions.finish("会话已清空。")
+        except Exception:
+            await sessions.finish("清空当前会话失败。")
+
     if not config_manager.config.session_control:
         sessions.skip()
 
-    # 获取当前用户/群组的记忆数据
     data = get_memory_data(event)
 
-    # 权限验证流程（仅群组消息需要验证）
     if isinstance(event, GroupMessageEvent) and (
         (
             await bot.get_group_member_info(
@@ -468,99 +539,31 @@ async def sessions_handle(bot: Bot, event: MessageEvent, args: Message = Command
         and event.user_id not in config_manager.config.admins
     ):
         await sessions.finish("你没有操作历史会话的权限")
-    # 解析输入参数
+
     arg_list = args.extract_plain_text().strip().split()
 
-    # 无参数时显示会话列表
-    if args.extract_plain_text().strip() == "":
-        message_content = "历史会话\n"
-        if data.get("sessions") is None:
-            await sessions.finish("没有历史会话")
-        # 构建会话列表消息
-        for index, msg in enumerate(data["sessions"]):
-            message_content += f"编号：{index}) ：{msg['messages'][0]['content'][9:]}... 时间：{datetime.fromtimestamp(msg['time']).strftime('%Y-%m-%d %I:%M:%S %p')}\n"
-        await sessions.finish(message_content)
+    if not arg_list:
+        await display_sessions(data)
 
-    # 处理带参数的命令
-    if len(arg_list) >= 1:
-        # 覆盖当前会话命令
-        if arg_list[0] == "set":
-            try:
-                if len(arg_list) >= 2:
-                    data["memory"]["messages"] = data["sessions"][int(arg_list[1])][
-                        "messages"
-                    ]
-                    data["timestamp"] = time.time()
-                    write_memory_data(event, data)
-                    await sessions.send("完成记忆覆盖。")
-                else:
-                    await sessions.finish("请输入正确编号")
-            except NoneBotException as e:
-                raise e
-            except Exception:
-                await sessions.finish("覆盖记忆文件失败，这个对话可能损坏了。")
-
-        # 删除会话命令
-        elif arg_list[0] == "del":
-            try:
-                if len(arg_list) >= 2:
-                    data["sessions"].remove(data["sessions"][int(arg_list[1])])
-                    write_memory_data(event, data)
-                else:
-                    await sessions.finish("请输入正确编号")
-            except NoneBotException as e:
-                raise e
-            except Exception:
-                await sessions.finish("删除指定编号会话失败。")
-
-        # 归档当前会话命令
-        elif arg_list[0] == "archive":
-            try:
-                if data["memory"]["messages"] != []:
-                    data["sessions"].append(
-                        {"messages": data["memory"]["messages"], "time": time.time()}
-                    )
-                    data["memory"]["messages"] = []
-                    data["timestamp"] = time.time()
-                    write_memory_data(event, data)
-                    await sessions.finish("当前会话已归档。")
-                else:
-                    await sessions.finish("当前对话为空！")
-            except NoneBotException as e:
-                raise e
-            except Exception:
-                await sessions.finish("归档当前会话失败。")
-
-        # 清空会话命令
-        elif arg_list[0] == "clear":
-            try:
-                data["sessions"] = []
-                data["timestamp"] = time.time()
-                write_memory_data(event, data)
-                await sessions.finish("会话已清空。")
-            except NoneBotException as e:
-                raise e
-            except Exception:
-                await sessions.finish("清空当前会话失败。")
-
-        # 帮助命令
-        elif arg_list[0] == "help":
-            await sessions.finish(
-                "Sessions指令帮助：\nset：覆盖当前会话为指定编号的会话\ndel：删除指定编号的会话\narchive：归档当前会话\nclear：清空所有会话\n"
-            )
-
-
-"""
-@del_all_memory.handle()
-async def del_all_memory_handle(bot:Bot,event:MessageEvent):
-    global config
-    if not event.user_id in config['admins']:
-        await del_all_memory.finish("你没有权限执行此操作")
-"""
+    command = arg_list[0]
+    if command == "set":
+        await set_session(data, arg_list, event)
+    elif command == "del":
+        await delete_session(data, arg_list, event)
+    elif command == "archive":
+        await archive_session(data, event)
+    elif command == "clear":
+        await clear_sessions(data, event)
+    elif command == "help":
+        await sessions.finish(
+            "Sessions指令帮助：\nset：覆盖当前会话为指定编号的会话\ndel：删除指定编号的会话\narchive：归档当前会话\nclear：清空所有会话\n"
+        )
+    else:
+        await sessions.finish("未知命令，请输入/help查看帮助。")
 
 
 @set_preset.handle()
-async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+async def _(event: MessageEvent, args: Message = CommandArg()):
     # 检查插件是否启用
     if not config_manager.config.enable:
         set_preset.skip()
@@ -598,23 +601,8 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
 
 
 @presets.handle()
-async def _(bot: Bot, event: MessageEvent):
-    """
-    处理预设命令的异步函数。
-
-    该函数响应预设命令，检查用户是否为管理员，然后返回当前模型预设的信息。
-
-    参数:
-    - bot: Bot对象，用于与平台交互。
-    - event: MessageEvent对象，包含事件相关的信息。
-
-    使用的全局变量:
-    - admins: 包含管理员用户ID的列表。
-    - config: 包含配置信息的字典。
-    - ifenable: 布尔值，指示功能是否已启用。
-
-    """
-
+async def _(event: MessageEvent):
+    """处理模型预设查看的事件处理器"""
     # 检查功能是否已启用，未启用则跳过处理
     if not config_manager.config.enable:
         presets.skip()
@@ -636,17 +624,7 @@ async def _(bot: Bot, event: MessageEvent):
 
 @prompt.handle()
 async def _(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
-    """
-    处理prompt命令的异步函数。此函数根据不同的条件和用户输入来管理prompt的设置和查询。
-
-    参数:
-    - bot: Bot对象，用于发送消息和与机器人交互。
-    - event: GroupMessageEvent对象，包含事件的详细信息，如用户ID和消息内容。
-    - args: Message对象，包含用户输入的命令参数。
-
-    返回值:
-    无返回值。
-    """
+    """处理prompt命令的异步函数。此函数根据不同的条件和用户输入来管理prompt的设置和查询"""
     # 检查是否启用prompt功能，未启用则跳过处理
     if not config_manager.config.enable:
         prompt.skip()
@@ -699,18 +677,8 @@ async def _(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
 
 # 当有人加入群聊时触发的事件处理函数
 @add_notice.handle()
-async def _(bot: Bot, event: GroupIncreaseNoticeEvent):
-    """
-    处理群聊增加通知事件的异步函数。
-
-    参数:
-    - bot: Bot对象，用于访问和操作机器人。
-    - event: GroupIncreaseNoticeEvent对象，包含事件相关信息。
-
-    此函数主要用于处理当机器人所在的群聊中增加新成员时的通知事件。
-    它会根据全局配置变量config中的设置决定是否发送欢迎消息。
-    """
-    # 检查全局配置，如果未启用，则跳过处理
+async def _(event: GroupIncreaseNoticeEvent):
+    """处理群聊增加通知事件的异步函数"""
     if not config_manager.config.enable:
         add_notice.skip()
     # 检查配置，如果不发送被邀请后的消息，则直接返回
@@ -725,32 +693,21 @@ async def _(bot: Bot, event: GroupIncreaseNoticeEvent):
 
 # 处理调试模式开关的函数
 @debug_switch.handle()
-async def _(bot: Bot, event: MessageEvent, matcher: Matcher):
-    """
-    根据用户权限开启或关闭调试模式。
-
-    参数:
-    - bot: Bot对象，用于调用API
-    - event: 消息事件对象，包含消息相关信息
-    - matcher: Matcher对象，用于控制事件处理流程
-
-    返回值: 无
-    """
-    # 如果配置中未启用调试模式，跳过后续处理
+async def _(event: MessageEvent, matcher: Matcher):
+    """根据用户权限开启或关闭调试模式"""
     if not config_manager.config.enable:
         matcher.skip()
     # 如果不是管理员用户，直接返回
     if event.user_id not in config_manager.config.admins:
         return
-    global debug
     # 根据当前调试模式状态，开启或关闭调试模式，并发送通知
-    if debug:
-        debug = False
+    if chat_manager.debug:
+        chat_manager.debug = False
         await debug_switch.finish(
             "已关闭调试模式（该模式适用于开发者，如果你作为普通用户使用，请关闭调试模式）"
         )
     else:
-        debug = True
+        chat_manager.debug = True
         await debug_switch.finish(
             "已开启调试模式（该模式适用于开发者，如果你作为普通用户使用，请关闭调试模式）"
         )
@@ -759,6 +716,8 @@ async def _(bot: Bot, event: MessageEvent, matcher: Matcher):
 # 当有消息撤回时触发处理函数
 @recall.handle()
 async def _(bot: Bot, event: GroupRecallNoticeEvent, matcher: Matcher):
+    """处理消息撤回通知事件"""
+
     # 检查是否启用了插件功能，未启用则跳过后续处理
     if not config_manager.config.enable:
         matcher.skip()
@@ -780,25 +739,18 @@ async def _(bot: Bot, event: GroupRecallNoticeEvent, matcher: Matcher):
         return
 
 
-# 定义聊天功能菜单的初始消息内容，包含各种命令及其描述
-menu_msg = "聊天功能菜单:\n/聊天菜单 唤出菜单 \n/del_memory 丢失这个群/聊天的记忆 \n/enable 在群聊启用聊天 \n/disable 在群聊里关闭聊天\n/prompt <arg> [text] 设置聊群自定义补充prompt（--(show) 展示当前提示词，--(clear) 清空当前prompt，--(set) [文字]则设置提示词，e.g.:/prompt --(show)）,/prompt --(set) [text]。）\n/sessions指令帮助：\nset：覆盖当前会话为指定编号的会话\ndel：删除指定编号的会话\narchive：归档当前会话\nclear：清空所有会话\nPreset帮助：\n/presets 列出所有读取到的模型预设\n/set_preset 或 /设置预设 或 /设置模型预设  <预设名> 设置当前使用的预设"
-
-
 # 处理菜单命令的函数
 @menu.handle()
-async def _(event: MessageEvent, matcher: Matcher):
-    # 声明全局变量，用于访问和修改自定义菜单、默认菜单消息以及配置信息
-    global custom_menu, menu_msg, config
-
-    # 检查聊天功能是否已启用，未启用则跳过处理
+async def _(matcher: Matcher):
+    """处理聊天菜单命令"""
     if not config_manager.config.enable:
         matcher.skip()
 
     # 初始化消息内容为默认菜单消息
-    msg = menu_msg
+    msg = chat_manager.menu_msg
 
     # 遍历自定义菜单项，添加到消息内容中
-    for menus in custom_menu:
+    for menus in chat_manager.custom_menu:
         msg += f"\n{menus['cmd']} {menus['describe']}"
 
     # 根据配置信息，添加群聊或私聊聊天可用性的提示信息
@@ -810,154 +762,104 @@ async def _(event: MessageEvent, matcher: Matcher):
 
 @poke.handle()
 async def _(event: PokeNotifyEvent, bot: Bot, matcher: Matcher):
-    """
-    处理戳一戳事件的异步函数。
+    """处理戳一戳事件"""
 
-    参数:
-    - event: 戳一戳通知事件对象。
-    - bot: 机器人对象。
-    - matcher: 匹配器对象，用于控制事件处理流程。
+    async def handle_group_poke(event: PokeNotifyEvent, bot: Bot):
+        """处理群聊中的戳一戳事件"""
+        Group_Data = get_memory_data(event)
+        if not Group_Data["enable"]:
+            return
 
-    此函数主要根据配置信息和事件类型，响应戳一戳事件，并发送预定义的消息。
-    """
-    # 声明全局变量
-    global debug
+        user_name = (
+            await bot.get_group_member_info(
+                group_id=event.group_id, user_id=event.user_id
+            )
+        )["nickname"]
 
-    # 检查配置，如果机器人未启用，则跳过处理
-    if not config_manager.config.enable:
-        matcher.skip()
+        send_messages = [
+            {"role": "system", "content": f"{config_manager.group_train}"},
+            {
+                "role": "user",
+                "content": f"\\（戳一戳消息\\){user_name} (QQ:{event.user_id}) 戳了戳你",
+            },
+        ]
 
-    # 如果配置中未开启戳一戳回复，则直接返回
-    if not config_manager.config.poke_reply:
-        poke.skip()
-        return
+        response = await process_poke_event(event, send_messages)
+        message = (
+            MessageSegment.at(user_id=event.user_id)
+            + MessageSegment.text(" ")
+            + MessageSegment.text(response)
+        )
 
-    # 如果事件的目标ID不是机器人自身，则直接返回
-    if event.target_id != event.self_id:
-        return
-
-    try:
-        # 判断事件是否发生在群聊中
-        if event.group_id is not None:
-            Group_Data = get_memory_data(event)
-            i = Group_Data
-            # 如果群聊ID匹配且群聊功能开启，则处理事件
-            if i["enable"]:
-                # 获取用户昵称
-                user_name = (
-                    await bot.get_group_member_info(
-                        group_id=event.group_id, user_id=event.user_id
-                    )
-                )["nickname"]
-                # 构建发送的消息内容
-                send_messages = [
-                    {"role": "system", "content": f"{config_manager.group_train}"},
-                    {
-                        "role": "user",
-                        "content": f"\\（戳一戳消息\\){user_name} (QQ:{event.user_id}) 戳了戳你",
-                    },
-                ]
-                if config_manager.config.matcher_function:
-                    _matcher = SuggarMatcher(event_type=EventType().before_poke())
-                    poke_event = PokeEvent(
-                        nbevent=event,
-                        send_message=send_messages,
-                        model_response=[""],
-                        user_id=event.user_id,
-                    )
-                    await _matcher.trigger_event(poke_event, _matcher)
-                    send_messages = poke_event.get_send_message()
-                # 初始化响应内容和调试信息
-                response = await get_chat(send_messages)
-                if config_manager.config.matcher_function:
-                    _matcher = SuggarMatcher(event_type=EventType().poke())
-                    poke_event = PokeEvent(
-                        nbevent=event,
-                        send_message=send_messages,
-                        model_response=[response],
-                        user_id=event.user_id,
-                    )
-                    await _matcher.trigger_event(poke_event, _matcher)
-                    response = poke_event.model_response
-                # 如果调试模式开启，发送调试信息给管理员
-                if debug:
-                    await send_to_admin(
-                        f"POKEMSG{event.group_id}/{event.user_id}\n {send_messages}"
-                    )
-                # 构建最终消息并发送
-                message = (
-                    MessageSegment.at(user_id=event.user_id)
-                    + MessageSegment.text(" ")
-                    + MessageSegment.text(response)
-                )
-
-                if not config_manager.config.nature_chat_style:
-                    await poke.send(message)
-                else:
-                    if response_list := split_message_into_chats(response):
-                        # 将@用户添加到第一条消息
-                        first_message = (
-                            MessageSegment.at(event.user_id)
-                            + MessageSegment.text(" ")
-                            + response_list[0]
-                        )
-                        await poke.send(first_message)
-
-                        # 发送剩余消息并保持原有延迟逻辑
-                        for message in response_list[1:]:
-                            await poke.send(message)
-                            await asyncio.sleep(
-                                random.randint(1, 3)
-                                + len(message) // random.randint(80, 100)
-                            )
-
+        if not config_manager.config.nature_chat_style:
+            await poke.send(message)
         else:
-            name = get_friend_info(event.user_id, bot)
-            send_messages = [
-                {"role": "system", "content": f"{config_manager.private_train}"},
-                {
-                    "role": "user",
-                    "content": f" \\（戳一戳消息\\) {name}(QQ:{event.user_id}) 戳了戳你",
-                },
-            ]
-            if config_manager.config.matcher_function:
-                _matcher = SuggarMatcher(event_type=EventType().before_poke())
-                poke_event = PokeEvent(
-                    nbevent=event,
-                    send_message=send_messages,
-                    model_response=[""],
-                    user_id=event.user_id,
-                )
-                await _matcher.trigger_event(poke_event, _matcher)
-                send_messages = poke_event.get_send_message()
-            response = await get_chat(send_messages)
-            if config_manager.config.matcher_function:
-                _matcher = SuggarMatcher(event_type=EventType().poke())
-                poke_event = PokeEvent(
-                    nbevent=event,
-                    send_message=send_messages,
-                    model_response=[response],
-                    user_id=event.user_id,
-                )
-                await _matcher.trigger_event(poke_event, _matcher)
-                response = poke_event.model_response
-            if debug:
-                await send_to_admin(f"POKEMSG {send_messages}")
-            message = MessageSegment.text(response)
+            await send_split_messages(response, event.user_id)
 
-            if not config_manager.config.nature_chat_style:
+    async def handle_private_poke(event: PokeNotifyEvent, bot: Bot):
+        """处理私聊中的戳一戳事件"""
+        name = get_friend_info(event.user_id, bot)
+        send_messages = [
+            {"role": "system", "content": f"{config_manager.private_train}"},
+            {
+                "role": "user",
+                "content": f" \\（戳一戳消息\\) {name}(QQ:{event.user_id}) 戳了戳你",
+            },
+        ]
+
+        response = await process_poke_event(event, send_messages)
+        if not config_manager.config.nature_chat_style:
+            await poke.send(MessageSegment.text(response))
+        else:
+            await send_split_messages(response, event.user_id)
+
+    async def process_poke_event(event: PokeNotifyEvent, send_messages: list) -> str:
+        """处理戳一戳事件的核心逻辑"""
+        if config_manager.config.matcher_function:
+            _matcher = SuggarMatcher(event_type=EventType().before_poke())
+            poke_event = PokeEvent(
+                nbevent=event,
+                send_message=send_messages,
+                model_response=[""],
+                user_id=event.user_id,
+            )
+            await _matcher.trigger_event(poke_event, _matcher)
+            send_messages = poke_event.get_send_message()
+
+        response = await get_chat(send_messages)
+
+        if config_manager.config.matcher_function:
+            _matcher = SuggarMatcher(event_type=EventType().poke())
+            poke_event = PokeEvent(
+                nbevent=event,
+                send_message=send_messages,
+                model_response=[response],
+                user_id=event.user_id,
+            )
+            await _matcher.trigger_event(poke_event, _matcher)
+            response = poke_event.model_response
+
+        if chat_manager.debug:
+            await send_to_admin(f"POKEMSG {send_messages}")
+
+        return response
+
+    async def send_split_messages(response: str, user_id: int):
+        """发送分段消息"""
+        if response_list := split_message_into_chats(response):
+            first_message = (
+                MessageSegment.at(user_id) + MessageSegment.text(" ") + response_list[0]
+            )
+            await poke.send(first_message)
+
+            for message in response_list[1:]:
                 await poke.send(message)
-            else:
-                response_list = split_message_into_chats(response)
-                # await poke.send(MessageSegment.at(event.user_id))
-                for message in response_list:
-                    await poke.send(message)
-                    await asyncio.sleep(
-                        random.randint(1, 3) + len(message) // random.randint(80, 100)
-                    )
+                await asyncio.sleep(
+                    random.randint(1, 3) + len(message) // random.randint(80, 100)
+                )
 
-    except Exception:
-        # 异常处理，记录错误信息并发送给管理员
+    async def handle_poke_exception():
+        """处理戳一戳事件中的异常"""
         exc_type, exc_value, exc_traceback = sys.exc_info()
         logger.error(
             f"Exception type: {exc_type.__name__}"
@@ -974,23 +876,25 @@ async def _(event: PokeNotifyEvent, bot: Bot, matcher: Matcher):
             f"Detailed exception info:\n{''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))}"
         )
 
+    if not config_manager.config.enable or not config_manager.config.poke_reply:
+        matcher.skip()
+        return
+
+    if event.target_id != event.self_id:
+        return
+
+    try:
+        if event.group_id is not None:
+            await handle_group_poke(event, bot)
+        else:
+            await handle_private_poke(event, bot)
+    except Exception:
+        await handle_poke_exception()
+
 
 @disable.handle()
 async def _(bot: Bot, event: GroupMessageEvent, matcher: Matcher):
-    """
-    处理禁用聊天功能的异步函数。
-
-    当接收到群消息事件时，检查当前配置是否允许执行禁用操作，如果不允许则跳过处理。
-    检查发送消息的成员是否为普通成员且不在管理员列表中，如果是则发送提示消息并返回。
-    如果成员有权限，记录日志并更新记忆中的数据结构以禁用聊天功能，然后发送确认消息。
-
-    参数:
-    - bot: Bot对象，用于调用机器人API。
-    - event: GroupMessageEvent对象，包含群消息事件的相关信息。
-    - matcher: Matcher对象，用于控制事件处理流程。
-
-    返回: 无
-    """
+    """处理禁用聊天功能的异步函数"""
     # 检查全局配置是否启用，如果未启用则跳过后续处理
     if not config_manager.config.enable:
         matcher.skip()
@@ -1023,19 +927,7 @@ async def _(bot: Bot, event: GroupMessageEvent, matcher: Matcher):
 
 @enable.handle()
 async def _(bot: Bot, event: GroupMessageEvent, matcher: Matcher):
-    """
-    处理启用聊天功能的命令。
-
-    该函数检查当前配置是否允许启用聊天功能，如果允许则检查发送命令的用户是否为管理员。
-    如果用户是普通成员且不在管理员列表中，则发送提示信息并返回。
-    如果用户有权限，且当前聊天功能已启用，则发送“聊天启用”的消息。
-    如果聊天功能未启用，则启用聊天功能并发送“聊天启用”的消息。
-
-    参数:
-    - bot: Bot对象，用于调用API。
-    - event: GroupMessageEvent对象，包含事件相关的信息。
-    - matcher: Matcher对象，用于控制事件的处理流程。
-    """
+    """处理启用聊天功能的命令"""
     # 检查全局配置，如果未启用则跳过后续处理
     if not config_manager.config.enable:
         matcher.skip()
@@ -1066,20 +958,7 @@ async def _(bot: Bot, event: GroupMessageEvent, matcher: Matcher):
 
 @del_memory.handle()
 async def _(bot: Bot, event: MessageEvent, matcher: Matcher):
-    """
-    处理删除记忆指令的异步函数。
-
-    参数:
-    - bot: Bot对象，用于与机器人交互。
-    - event: MessageEvent对象，包含事件的所有信息。
-    - matcher: Matcher对象，用于控制事件的处理流程。
-
-    此函数主要用于处理来自群聊或私聊的消息事件，根据用户权限删除机器人记忆中的上下文信息。
-    """
-
-    # 声明全局变量
-    global admins, config
-
+    """处理删除记忆指令"""
     # 检查配置以确定是否启用功能
     if not config_manager.config.enable:
         matcher.skip()
@@ -1123,510 +1002,317 @@ async def _(bot: Bot, event: MessageEvent, matcher: Matcher):
 
 @chat.handle()
 async def _(event: MessageEvent, matcher: Matcher, bot: Bot):
-    global running_messages, session_clear_group, session_clear_user
-    """
-    处理聊天事件的主函数。
+    """处理聊天事件"""
 
-    参数:
-    - event: MessageEvent - 消息事件对象，包含消息的相关信息。
-    - matcher: Matcher - 用于控制事件处理流程的对象。
-    - bot: Bot - 机器人对象，用于调用机器人相关API。
+    async def handle_group_message(
+        event: GroupMessageEvent,
+        matcher: Matcher,
+        bot: Bot,
+        group_data: dict,
+        memory_length_limit: int,
+        Date: str,
+    ):
+        if not config_manager.config.enable_group_chat:
+            matcher.skip()
 
-    此函数负责根据配置和消息类型处理不同的聊天消息，包括群聊和私聊消息的处理。
-    """
-    global debug
-    # 检查配置，如果未启用则跳过处理
+        if not group_data["enable"]:
+            await chat.send("聊天没有启用")
+            return
+
+        await manage_sessions(event, group_data, chat_manager.session_clear_group)
+
+        group_id = event.group_id
+        user_id = event.user_id
+        user_name = (
+            await bot.get_group_member_info(group_id=group_id, user_id=user_id)
+        )["nickname"]
+        content = await synthesize_message(event.get_message(), bot)
+
+        if content.strip() == "":
+            content = ""
+
+        role = await get_user_role(bot, group_id, user_id)
+        logger.debug(f"{Date}{user_name}（{user_id}）说:{content}")
+
+        if event.reply:
+            content = await handle_reply(event.reply, bot, group_id, content)
+
+        group_data["memory"]["messages"].append(
+            {
+                "role": "user",
+                "content": f"[{role}][{Date}][{user_name}（{user_id}）]说:{content if config_manager.config.parse_segments else event.message.extract_plain_text()}",
+            }
+        )
+
+        await enforce_memory_limit(group_data, memory_length_limit)
+        await enforce_token_limit(group_data, config_manager.group_train)
+
+        send_messages = prepare_send_messages(group_data, config_manager.group_train)
+        response = await process_chat(event, send_messages)
+
+        group_data["memory"]["messages"].append(
+            {"role": "assistant", "content": str(response)}
+        )
+        await send_response(event, response)
+
+        write_memory_data(event, group_data)
+
+    async def handle_private_message(
+        event: PrivateMessageEvent,
+        matcher: Matcher,
+        bot: Bot,
+        private_data: dict,
+        memory_length_limit: int,
+        Date: str,
+    ):
+        if not config_manager.config.enable_private_chat:
+            matcher.skip()
+
+        await manage_sessions(event, private_data, chat_manager.session_clear_user)
+
+        content = await synthesize_message(event.get_message(), bot)
+
+        if content.strip() == "":
+            content = ""
+
+        if event.reply:
+            content = await handle_reply(event.reply, bot, None, content)
+
+        private_data["memory"]["messages"].append(
+            {
+                "role": "user",
+                "content": f"{Date}{await get_friend_info(event.user_id, bot=bot)}（{event.user_id}）： {str(content) if config_manager.config.parse_segments else event.message.extract_plain_text()}",
+            }
+        )
+
+        await enforce_memory_limit(private_data, memory_length_limit)
+        await enforce_token_limit(private_data, config_manager.private_train)
+
+        send_messages = prepare_send_messages(
+            private_data, config_manager.private_train
+        )
+        response = await process_chat(event, send_messages)
+
+        private_data["memory"]["messages"].append(
+            {"role": "assistant", "content": str(response)}
+        )
+        await send_response(event, response)
+
+        write_memory_data(event, private_data)
+
+    async def manage_sessions(
+        event: GroupMessageEvent | PrivateMessageEvent,
+        data: dict,
+        session_clear_list: list,
+    ):
+        if data.get("sessions") is None:
+            data["sessions"] = []
+        if data.get("timestamp") is None:
+            data["timestamp"] = time.time()
+
+        if config_manager.config.session_control:
+            for session in session_clear_list:
+                if session["id"] == (
+                    event.group_id
+                    if isinstance(event, GroupMessageEvent)
+                    else event.user_id
+                ):
+                    if not event.reply:
+                        session_clear_list.remove(session)
+                    break
+
+            if (time.time() - data["timestamp"]) >= (
+                config_manager.config.session_control_time * 60
+            ):
+                data["sessions"].append(
+                    {"messages": data["memory"]["messages"], "time": time.time()}
+                )
+                while (
+                    len(data["sessions"])
+                    > config_manager.config.session_control_history
+                ):
+                    data["sessions"].remove(data["sessions"][0])
+                data["memory"]["messages"] = []
+                data["timestamp"] = time.time()
+                write_memory_data(event, data)
+                chated = await chat.send(
+                    f'如果想和我继续用刚刚的上下文聊天，快回复我✨"继续"✨吧！\n（超过{config_manager.config.session_control_time}分钟没理我我就会被系统抱走存档哦！）'
+                )
+                session_clear_list.append(
+                    {
+                        "id": (
+                            event.group_id
+                            if isinstance(event, GroupMessageEvent)
+                            else event.user_id
+                        ),
+                        "message_id": chated["message_id"],
+                        "timestamp": time.time(),
+                    }
+                )
+                return
+            elif event.reply:
+                for session in session_clear_list:
+                    if (
+                        session["id"]
+                        == (
+                            event.group_id
+                            if isinstance(event, GroupMessageEvent)
+                            else event.user_id
+                        )
+                        and "继续" in event.reply.message.extract_plain_text()
+                    ):
+                        with contextlib.suppress(Exception):
+                            if time.time() - session["timestamp"] < 100:
+                                await bot.delete_msg(message_id=session["message_id"])
+                        session_clear_list.remove(session)
+                        data["memory"]["messages"] = data["sessions"][-1]["messages"]
+                        data["sessions"].pop()
+                        await chat.send("让我们继续聊天吧～")
+                        return write_memory_data(event, data)
+
+    async def handle_reply(
+        reply: Reply, bot: Bot, group_id: int | None, content: str
+    ) -> str:
+        if not reply.sender.user_id:
+            return content
+        dt_object = datetime.fromtimestamp(reply.time)
+        weekday = dt_object.strftime("%A")
+        formatted_time = dt_object.strftime("%Y-%m-%d %I:%M:%S %p")
+        role = (
+            await get_user_role(bot, group_id, reply.sender.user_id) if group_id else ""
+        )
+        reply_content = await synthesize_message(reply.message, bot)
+        return f"{content}\n（（（引用的消息）））：\n{formatted_time} {weekday} [{role}]{reply.sender.nickname}（QQ:{reply.sender.user_id}）说：{reply_content}"
+
+    async def get_user_role(bot: Bot, group_id: int, user_id: int) -> str:
+        role = (await bot.get_group_member_info(group_id=group_id, user_id=user_id))[
+            "role"
+        ]
+        return {"admin": "群管理员", "owner": "群主", "member": "普通成员"}.get(
+            role, "[获取身份失败]"
+        )
+
+    async def enforce_memory_limit(data: dict, memory_length_limit: int):
+        while len(data["memory"]["messages"]) > memory_length_limit or (
+            data["memory"]["messages"][0]["role"] != "user"
+        ):
+            del data["memory"]["messages"][0]
+
+    async def enforce_token_limit(data: dict, train: dict):
+        if config_manager.config.enable_tokens_limit:
+            memory_l = [train.copy(), *data["memory"]["messages"].copy()]
+            full_string = "".join(st["content"] for st in memory_l)
+            tokens = hybrid_token_count(
+                full_string, config_manager.config.tokens_count_mode
+            )
+            while tokens > config_manager.config.session_max_tokens:
+                del data["memory"]["messages"][0]
+                full_string = "".join(
+                    st["content"]
+                    for st in [train.copy(), *data["memory"]["messages"].copy()]
+                )
+                tokens = hybrid_token_count(
+                    full_string, config_manager.config.tokens_count_mode
+                )
+
+    def prepare_send_messages(data: dict, train: dict) -> list:
+        train["content"] += (
+            f"\n以下是一些补充内容，如果与上面任何一条有冲突请忽略。\n{data.get('prompt', '无')}"
+        )
+        send_messages = data["memory"]["messages"].copy()
+        send_messages.insert(0, train)
+        return send_messages
+
+    async def process_chat(event: MessageEvent, send_messages: list) -> str:
+        if config_manager.config.matcher_function:
+            _matcher = SuggarMatcher(event_type=EventType().before_chat())
+            chat_event = ChatEvent(
+                nbevent=event,
+                send_message=send_messages,
+                model_response=[""],
+                user_id=event.user_id,
+            )
+            await _matcher.trigger_event(chat_event, _matcher)
+            send_messages = chat_event.get_send_message()
+
+        response = await get_chat(send_messages)
+
+        if config_manager.config.matcher_function:
+            _matcher = SuggarMatcher(event_type=EventType().chat())
+            chat_event = ChatEvent(
+                nbevent=event,
+                send_message=send_messages,
+                model_response=[response],
+                user_id=event.user_id,
+            )
+            await _matcher.trigger_event(chat_event, _matcher)
+            response = chat_event.model_response
+
+        return response
+
+    async def send_response(event: MessageEvent, response: str):
+        if not config_manager.config.nature_chat_style:
+            await chat.send(
+                MessageSegment.reply(event.message_id) + MessageSegment.text(response)
+            )
+        elif response_list := split_message_into_chats(response):
+            first_message = (
+                MessageSegment.at(event.user_id)
+                + MessageSegment.text(" ")
+                + response_list[0]
+            )
+            await chat.send(first_message)
+            for message in response_list[1:]:
+                await chat.send(message)
+                await asyncio.sleep(
+                    random.randint(1, 3) + len(message) // random.randint(80, 100)
+                )
+
+    async def handle_exception():
+        await chat.send("出错了稍后试试吧（错误已反馈）")
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        logger.error(
+            f"Exception type: {exc_type.__name__}"
+            if exc_type
+            else "Exception type: None"
+        )
+        logger.error(f"Exception message: {exc_value!s}")
+        import traceback
+
+        await send_to_admin(f"出错了！{exc_value},\n{exc_type!s}")
+        await send_to_admin(f"{traceback.format_exc()}")
+        logger.error(
+            f"Detailed exception info:\n{''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))}"
+        )
+
     if not config_manager.config.enable:
         matcher.skip()
 
-    memory_lenth_limit = config_manager.config.memory_lenth_limit
+    memory_length_limit = config_manager.config.memory_lenth_limit
     Date = get_current_datetime_timestamp()
     bot = nonebot.get_bot()
-    global group_train, private_train
 
-    content = ""
-    logger.info(event.get_message())
-    # 如果消息以“/”开头，则跳过处理
     if event.message.extract_plain_text().strip().startswith("/"):
         matcher.skip()
-        return
 
-    # 如果消息为“菜单”，则发送菜单消息并结束处理
     if event.message.extract_plain_text().startswith("菜单"):
-        await matcher.finish(menu_msg)
-        return
+        await matcher.finish(chat_manager.menu_msg)
 
-    Group_Data = get_memory_data(event)
-    Private_Data = get_memory_data(event)
+    group_data = get_memory_data(event)
+    private_data = get_memory_data(event)
 
-    # 根据消息类型处理消息
-    if event.get_message():
-        try:
-            if isinstance(event, GroupMessageEvent):
-                if not config_manager.config.enable_group_chat:
-                    matcher.skip()
-                data = Group_Data
-                if data["enable"]:
-                    if data.get("sessions") is None:
-                        data["sessions"] = []
-                    if data.get("timestamp") is None:
-                        data["timestamp"] = time.time()
-                    if config_manager.config.session_control:
-                        for session in session_clear_group:
-                            if session["id"] == event.group_id:
-                                if not event.reply:
-                                    session_clear_group.remove(session)
-                                break
-                        if (time.time() - data["timestamp"]) >= (
-                            config_manager.config.session_control_time * 60
-                        ) and data["memory"]["messages"] != []:
-                            data["sessions"].append(
-                                {
-                                    "messages": data["memory"]["messages"],
-                                    "time": time.time(),
-                                }
-                            )
-                            while (
-                                len(data["sessions"])
-                                > config_manager.config.session_control_history
-                            ):
-                                data["sessions"].remove(data["sessions"][0])
-                            data["memory"]["messages"] = []
-                            data["timestamp"] = time.time()
-                            write_memory_data(event, data)
-                            chated = await chat.send(
-                                f'如果想和我继续用刚刚的上下文聊天，快回复我✨"继续"✨吧！\n（超过{config_manager.config.session_control_time}分钟没理我我就会被系统抱走存档哦！）'
-                            )
-                            session_clear_group.append(
-                                {
-                                    "id": event.group_id,
-                                    "message_id": chated["message_id"],
-                                    "timestamp": time.time(),
-                                }
-                            )
-                            return
-                        elif event.reply:
-                            for session in session_clear_group:
-                                if (
-                                    session["id"] == event.group_id
-                                    and "继续"
-                                    in event.reply.message.extract_plain_text()
-                                ):
-                                    with contextlib.suppress(Exception):
-                                        if time.time() - session["timestamp"] < 100:
-                                            await bot.delete_msg(
-                                                message_id=session["message_id"]
-                                            )
-                                    session_clear_group.remove(session)
-                                    data["memory"]["messages"] = data["sessions"][
-                                        len(data["sessions"]) - 1
-                                    ]["messages"]
-                                    data["sessions"].remove(
-                                        data["sessions"][len(data["sessions"]) - 1]
-                                    )
-                                    await chat.send("让我们继续聊天吧～")
-                                    return write_memory_data(event, data)
-
-                    group_id = event.group_id
-                    user_id = event.user_id
-                    content = ""
-                    user_name = (
-                        await bot.get_group_member_info(
-                            group_id=group_id, user_id=user_id
-                        )
-                    )["nickname"]
-                    content = await synthesize_message(event.get_message(), bot)
-                    if content.strip() == "":
-                        content = ""
-                    role = await bot.get_group_member_info(
-                        group_id=group_id, user_id=user_id
-                    )
-
-                    if role["role"] == "admin":
-                        role = "群管理员"
-                    elif role["role"] == "owner":
-                        role = "群主"
-                    elif role["role"] == "member":
-                        role = "普通成员"
-                    logger.debug(f"{Date}{user_name}（{user_id}）说:{content}")
-                    reply = "（（（引用的消息）））：\n"
-                    if event.reply:
-                        dt_object = datetime.fromtimestamp(event.reply.time)
-                        weekday = dt_object.strftime("%A")
-                        # 格式化输出结果
-                        try:
-                            rl = await bot.get_group_member_info(
-                                group_id=group_id, user_id=event.reply.sender.user_id
-                            )
-
-                            if rl["rl"] == "admin":
-                                rl = "群管理员"
-                            elif rl["rl"] == "owner":
-                                rl = "群主"
-                            elif rl["rl"] == "member":
-                                rl = "普通成员"
-                            elif event.reply.sender.user_id == event.self_id:
-                                rl = "自己"
-                        except Exception:
-                            rl = "自己" if event.reply.sender.user_id == event.self_id else "[获取身份失败]"
-                        formatted_time = dt_object.strftime("%Y-%m-%d %I:%M:%S %p")
-                        DT = f"{formatted_time} {weekday} [{rl}]{event.reply.sender.nickname}（QQ:{event.reply.sender.user_id}）说："
-                        reply += DT
-                        reply += await synthesize_message(event.reply.message, bot)
-                        if config_manager.config.parse_segments:
-                            content += str(reply)
-                        else:
-                            content += event.reply.message.extract_plain_text()
-                        logger.debug(reply)
-                        logger.debug(
-                            f"[{role}][{Date}][{user_name}（{user_id}）]说:{content}"
-                        )
-
-                    data["memory"]["messages"].append(
-                        {
-                            "role": "user",
-                            "content": f"[{role}][{Date}][{user_name}（{user_id}）]说:{content if config_manager.config.parse_segments else event.message.extract_plain_text()}",
-                        }
-                    )
-                    while (len(data["memory"]["messages"]) > memory_lenth_limit) or (
-                        data["memory"]["messages"][0]["role"] != "user"
-                    ):
-                        del data["memory"]["messages"][0]
-                    if config_manager.config.enable_tokens_limit:
-                        full_string = ""
-                        memory_l = [
-                            config_manager.group_train.copy(),
-                            *data["memory"]["messages"].copy(),
-                        ]
-                        for st in memory_l:
-                            full_string += st["content"]
-                        tokens = hybrid_token_count(
-                            full_string, config_manager.config.tokens_count_mode
-                        )
-                        logger.debug(f"tokens:{tokens}")
-                        logger.debug(
-                            f"tokens_limit:{config_manager.config.session_max_tokens}"
-                        )
-                        while tokens > config_manager.config.session_max_tokens:
-                            del data["memory"]["messages"][0]
-                            full_string = ""
-                            for st in [
-                                config_manager.group_train.copy(),
-                                *data["memory"]["messages"].copy(),
-                            ]:
-                                full_string += st["content"]
-                            tokens = hybrid_token_count(
-                                full_string, config_manager.config.tokens_count_mode
-                            )
-
-                    send_messages = []
-                    send_messages = data["memory"]["messages"].copy()
-                    train = config_manager.group_train.copy()
-
-                    train["content"] += (
-                        f"\n以下是一些补充内容，如果与上面任何一条有冲突请忽略。\n{data.get('prompt', '无')}"
-                    )
-                    send_messages.insert(0, train)
-                    try:
-                        if config_manager.config.matcher_function:
-                            _matcher = SuggarMatcher(
-                                event_type=EventType().before_chat()
-                            )
-                            # todo send_messages传参改为data['memory']['messages']
-                            chat_event = ChatEvent(
-                                nbevent=event,
-                                send_message=send_messages,
-                                model_response=[""],
-                                user_id=event.user_id,
-                            )
-                            await _matcher.trigger_event(chat_event, _matcher)
-                            send_messages = chat_event.get_send_message()
-                        response = await get_chat(send_messages)
-                        if config_manager.config.matcher_function:
-                            _matcher = SuggarMatcher(event_type=EventType().chat())
-                            chat_event = ChatEvent(
-                                nbevent=event,
-                                send_message=send_messages,
-                                model_response=[response],
-                                user_id=event.user_id,
-                            )
-                            await _matcher.trigger_event(chat_event, _matcher)
-                            response = chat_event.model_response
-                        debug_response = response
-                        message = MessageSegment.reply(
-                            event.message_id
-                        ) + MessageSegment.text(response)
-
-                        if debug:
-                            await send_to_admin(
-                                f"{event.group_id}/{event.user_id}\n{event.message.extract_plain_text()}\n{type(event)}\nRESPONSE:\n{response!s}\nraw:{debug_response}"
-                            )
-                            logger.debug(data["memory"]["messages"])
-                            logger.debug(str(response))
-                            await send_to_admin(f"response:{response}")
-
-                        data["memory"]["messages"].append(
-                            {"role": "assistant", "content": str(response)}
-                        )
-
-                        if not config_manager.config.nature_chat_style:
-                            await chat.send(message)
-                        elif response_list := split_message_into_chats(
-                                response
-                            ):
-                            # 将@用户添加到第一条消息
-                            first_message = (
-                                MessageSegment.at(event.user_id)
-                                + MessageSegment.text(" ")
-                                + response_list[0]
-                            )
-                            await chat.send(first_message)
-
-                            # 发送剩余消息并保持原有延迟逻辑
-                            for message in response_list[1:]:
-                                await chat.send(message)
-                                await asyncio.sleep(
-                                    random.randint(1, 3)
-                                    + len(message)
-                                    // random.randint(80, 100)
-                                )
-                    except NoneBotException as e:
-                        raise e
-                    except Exception:
-                        await chat.send("出错了，稍后试试（错误已反馈")
-
-                        exc_type, exc_value, exc_traceback = sys.exc_info()
-                        logger.error(
-                            f"Exception type: {exc_type.__name__}"
-                            if exc_type
-                            else "Exception type: None"
-                        )
-                        logger.error(f"Exception message: {exc_value!s}")
-                        import traceback
-
-                        await send_to_admin(f"出错了！{exc_value},\n{exc_type!s}")
-                        await send_to_admin(f"{traceback.format_exc()}")
-
-                        logger.error(
-                            f"Detailed exception info:\n{''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))}"
-                        )
-                    finally:
-                        write_memory_data(event, data)
-
-                else:
-                    await chat.send("聊天没有启用")
-                    return
-            else:
-                if not config_manager.config.enable_private_chat:
-                    matcher.skip()
-                data = Private_Data
-                if data.get("sessions") is None:
-                    data["sessions"] = []
-                if data.get("timestamp") is None:
-                    data["timestamp"] = time.time()
-                if config_manager.config.session_control:
-                    for session in session_clear_user:
-                        if session["id"] == event.user_id:
-                            if not event.reply:
-                                session_clear_user.remove(session)
-                            break
-                    if (time.time() - data["timestamp"]) >= (
-                        config_manager.config.session_control_time * 60
-                    ):
-                        data["sessions"].append(
-                            {
-                                "messages": data["memory"]["messages"],
-                                "time": time.time(),
-                            }
-                        )
-                        while (
-                            len(data["sessions"])
-                            > config_manager.config.session_control_history
-                        ):
-                            data["sessions"].remove(data["sessions"][0])
-                        data["memory"]["messages"] = []
-                        data["timestamp"] = time.time()
-                        write_memory_data(event, data)
-                        chated = await chat.send(
-                            f'如果想和我继续用刚刚的上下文聊天，快回复我✨"继续"✨吧！\n（超过{config_manager.config.session_control_time}分钟没理我我就会被系统抱走存档哦！）'
-                        )
-                        session_clear_user.append(
-                            {
-                                "id": event.user_id,
-                                "message_id": chated["message_id"],
-                                "timestamp": time.time(),
-                            }
-                        )
-                        return
-                    elif event.reply:
-                        if (
-                            session["id"] == event.user_id
-                            and "继续" in event.reply.message.extract_plain_text()
-                        ):
-                            with contextlib.suppress(Exception):
-                                if time.time() - session["timestamp"] < 100:
-                                    await bot.delete_msg(
-                                        message_id=session["message_id"]
-                                    )
-                            session_clear_user.remove(session)
-                            data["memory"]["messages"] = data["sessions"][
-                                len(data["sessions"]) - 1
-                            ]["messages"]
-                            data["sessions"].remove(
-                                data["sessions"][len(data["sessions"]) - 1]
-                            )
-                            await chat.send("让我们继续聊天吧～")
-                if data["id"] == event.user_id:
-                    content = ""
-                    rl = ""
-                    content = await synthesize_message(event.get_message(), bot)
-                    if content.strip() == "":
-                        content = ""
-                    logger.debug(f"{content}")
-                    reply = "（（（引用的消息）））：\n"
-                    if event.reply:
-                        dt_object = datetime.fromtimestamp(event.reply.time)
-                        weekday = dt_object.strftime("%A")
-                        # 格式化输出结果
-
-                        formatted_time = dt_object.strftime("%Y-%m-%d %I:%M:%S %p")
-                        DT = f"{formatted_time} {weekday} {rl} {event.reply.sender.nickname}（QQ:{event.reply.sender.user_id}）说："
-                        reply += DT
-                        reply += await synthesize_message(event.reply.message, bot)
-                        if config_manager.config.parse_segments:
-                            content += str(reply)
-                        else:
-                            content += event.reply.message.extract_plain_text()
-                        logger.debug(reply)
-
-                    data["memory"]["messages"].append(
-                        {
-                            "role": "user",
-                            "content": f"{Date}{await get_friend_info(event.user_id, bot=bot)}（{event.user_id}）： {str(content) if config_manager.config.parse_segments else event.message.extract_plain_text()}",
-                        }
-                    )
-                    while (len(data["memory"]["messages"]) > memory_lenth_limit) or (
-                        data["memory"]["messages"][0]["role"] != "user"
-                    ):
-                        del data["memory"]["messages"][0]
-                    if config_manager.config.enable_tokens_limit:
-                        full_string = ""
-                        memory_l = [
-                            config_manager.private_train.copy(),
-                            *data["memory"]["messages"].copy(),
-                        ]
-                        for st in memory_l:
-                            full_string += st["content"]
-                        tokens = hybrid_token_count(
-                            full_string, config_manager.config.tokens_count_mode
-                        )
-                        logger.debug(f"tokens:{tokens}")
-                        logger.debug(
-                            f"tokens_limit:{config_manager.config.session_max_tokens}"
-                        )
-                        while tokens > config_manager.config.session_max_tokens:
-                            del data["memory"]["messages"][0]
-                            full_string = ""
-                            for st in [
-                                config_manager.private_train.copy(),
-                                *data["memory"]["messages"].copy(),
-                            ]:
-                                full_string += st["content"]
-                            tokens = hybrid_token_count(
-                                full_string, config_manager.config.tokens_count_mode
-                            )
-                    send_messages = []
-                    send_messages = data["memory"]["messages"].copy()
-                    send_messages.insert(0, config_manager.private_train)
-                    try:
-                        if config_manager.config.matcher_function:
-                            _matcher = SuggarMatcher(
-                                event_type=EventType().before_chat()
-                            )
-                            # todo send_messages传参改为data['memory']['messages']
-                            chat_event = ChatEvent(
-                                nbevent=event,
-                                send_message=send_messages,
-                                model_response=[""],
-                                user_id=event.user_id,
-                            )
-                            await _matcher.trigger_event(chat_event, _matcher)
-                            send_messages = chat_event.get_send_message()
-                        response = await get_chat(send_messages)
-                        if config_manager.config.matcher_function:
-                            _matcher = SuggarMatcher(event_type=EventType().chat())
-                            chat_event = ChatEvent(
-                                nbevent=event,
-                                send_message=send_messages,
-                                model_response=[response],
-                                user_id=event.user_id,
-                            )
-                            await _matcher.trigger_event(chat_event, _matcher)
-                            response = chat_event.model_response
-                        debug_response = response
-                        if debug:
-                            await send_to_admin(
-                                f"{event.user_id}\n{type(event)}\n{event.message.extract_plain_text()}\nRESPONSE:\n{response!s}\nraw:{debug_response}"
-                            )
-                        message = MessageSegment.text(response)
-
-                        if debug:
-                            logger.debug(data["memory"]["messages"])
-                            logger.debug(str(response))
-                            await send_to_admin(f"response:{response}")
-
-                        data["memory"]["messages"].append(
-                            {"role": "assistant", "content": str(response)}
-                        )
-
-                        if not config_manager.config.nature_chat_style:
-                            await chat.send(message)
-                        else:
-                            # await chat.send(MessageSegment.at(event.user_id))
-                            response_list = split_message_into_chats(response)
-                            for response in response_list:
-                                await chat.send(response)
-                                await asyncio.sleep(
-                                        random.randint(1, 3)
-                                        + len(message)
-                                        // random.randint(80, 100)
-                                )
-                    except NoneBotException as e:
-                        raise e
-                    except Exception:
-                        exc_type, exc_value, exc_traceback = sys.exc_info()
-                        await chat.send("出错了稍后试试（错误已反馈")
-                        logger.error(
-                            f"Exception type: {exc_type.__name__}"
-                            if exc_type
-                            else "Exception type: None"
-                        )
-                        logger.error(f"Exception message: {exc_value!s}")
-                        import traceback
-
-                        await send_to_admin(f"出错了！{exc_value},\n{exc_type!s}")
-                        await send_to_admin(f"{traceback.format_exc()} ")
-                        logger.error(
-                            f"Detailed exception info:\n{''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))}"
-                        )
-                    finally:
-                        write_memory_data(event, data)
-        except NoneBotException as e:
-            raise e
-        except Exception:
-            await chat.send("出错了稍后试试吧（错误已反馈 ")
-
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            logger.error(
-                f"Exception type: {exc_type.__name__}"
-                if exc_type
-                else "Exception type: None"
+    try:
+        if isinstance(event, GroupMessageEvent):
+            await handle_group_message(
+                event, matcher, bot, group_data, memory_length_limit, Date
             )
-            logger.error(f"Exception message: {exc_value!s}")
-            import traceback
-
-            await send_to_admin(f"出错了！{exc_value},\n{exc_type!s}")
-            await send_to_admin(f"{traceback.format_exc()}")
-            logger.error(
-                f"Detailed exception info:\n{''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))}"
+        elif isinstance(event, PrivateMessageEvent):
+            await handle_private_message(
+                event, matcher, bot, private_data, memory_length_limit, Date
             )
+        else:
+            matcher.skip()
+    except NoneBotException as e:
+        raise e
+    except Exception:
+        await handle_exception()
